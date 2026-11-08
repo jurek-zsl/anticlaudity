@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""anticlaudity: delegate bulk reading / mechanical work from Claude Code to the
+Antigravity CLI (`agy`), returning a compact structured result.
+
+  anticlaudity "task" [--path P]... [--model M] [--effort E] [--write]
+  anticlaudity stats [--days N]
+
+Read-only (agy --mode plan) by default. Every call is logged to a ledger so the
+real savings can be measured. Stdlib only; Python 3.8+.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+LEDGER = os.environ.get(
+    "ANTICLAUDITY_LEDGER", os.path.expanduser("~/.anticlaudity/ledger.jsonl")
+)
+AGY = os.environ.get("ANTICLAUDITY_AGY", "agy")
+DEFAULT_MODEL = os.environ.get("ANTICLAUDITY_MODEL", "gemini-3.8-flash-medium")
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next"}
+MAX_WALK_FILES = 20000
+BYTES_PER_TOKEN = 4  # rough estimate
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "line": {"type": "integer"},
+                    "note": {"type": "string"},
+                },
+                "required": ["path", "note"],
+            },
+        },
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "caveats": {"type": "string"},
+        "changed_files": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["summary", "findings", "confidence"],
+}
+
+PROMPT = """You are a research/worker assistant for another AI agent that will NOT re-read your sources, so accuracy matters more than speed.
+
+TASK:
+{task}
+
+SCOPE (read these; do not wander outside them unless the task requires it):
+{scope}
+
+RULES:
+- {mode_rule}
+- Report only what you verified in the files. Never guess or invent paths, line numbers or quotes.
+- Every finding needs an absolute `path` and a `line` when applicable. Keep each `note` under 40 words.
+- `summary`: at most 200 words, answering the task directly.
+- At most {max_findings} findings; prefer the most relevant ones.
+- If you could not find something or the scope was too large to cover, say so in `caveats` and lower `confidence`.
+- Set `confidence` honestly: high only if you covered the whole scope and the answer is unambiguous.
+"""
+
+
+def est_tokens_for_paths(paths):
+    total, files, truncated = 0, 0, False
+    for p in paths:
+        if os.path.isfile(p):
+            total += os.path.getsize(p)
+            files += 1
+            continue
+        for root, dirs, names in os.walk(p):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for n in names:
+                if files >= MAX_WALK_FILES:
+                    truncated = True
+                    break
+                try:
+                    total += os.path.getsize(os.path.join(root, n))
+                    files += 1
+                except OSError:
+                    pass
+            if truncated:
+                break
+    return total // BYTES_PER_TOKEN, files, truncated
+
+
+def log_ledger(entry):
+    try:
+        os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+        with open(LEDGER, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        print("anticlaudity: could not write ledger: %s" % e, file=sys.stderr)
+
+
+def fail(msg, entry=None, code=1):
+    out = {"status": "error", "error": msg}
+    if entry is not None:
+        entry.update(status="error", error=msg)
+        log_ledger(entry)
+    print(json.dumps(out))
+    sys.exit(code)
+
+
+def run_delegate(args):
+    task = sys.stdin.read() if args.task == "-" else args.task
+    if not task or not task.strip():
+        fail("empty task")
+
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    paths = []
+    for p in args.path:
+        ap = os.path.abspath(os.path.join(cwd, p))
+        if not os.path.exists(ap):
+            fail("path does not exist: %s" % ap)
+        paths.append(ap)
+
+    scope_tokens, n_files, truncated = est_tokens_for_paths(paths) if paths else (0, 0, False)
+    scope_txt = "\n".join("- " + p for p in paths) if paths else "- the current working directory (%s)" % cwd
+
+    mode = "accept-edits" if args.write else "plan"
+    mode_rule = (
+        "You may edit files, but only what the task requires. List every file you changed in `changed_files`."
+        if args.write
+        else "Read-only: do not modify any files or run state-changing commands."
+    )
+    prompt = PROMPT.format(
+        task=task.strip(), scope=scope_txt, mode_rule=mode_rule, max_findings=args.max_findings
+    )
+
+    cmd = [AGY, "-p", prompt, "--mode", mode, "--model", args.model,
+           "--output-format", "json"]
+    if args.effort:
+        cmd += ["--effort", args.effort]
+    cmd += ["--print-timeout", "%ds" % args.timeout]
+    for p in paths:
+        d = p if os.path.isdir(p) else os.path.dirname(p)
+        if not (d == cwd or d.startswith(cwd + os.sep)):
+            cmd += ["--add-dir", d]
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as sf:
+        json.dump(SCHEMA, sf)
+        schema_path = sf.name
+    cmd += ["--json-schema", schema_path]
+
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "task": task.strip()[:200],
+        "cwd": cwd,
+        "paths": paths,
+        "model": args.model,
+        "mode": mode,
+        "scope_files": n_files,
+        "scope_tokens_est": scope_tokens,
+        "scope_truncated": truncated,
+    }
+
+    t0 = time.time()
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                              timeout=args.timeout + 30)
+    except subprocess.TimeoutExpired:
+        fail("agy timed out after %ds" % args.timeout, entry)
+    except FileNotFoundError:
+        fail("agy not found on PATH (set ANTICLAUDITY_AGY)", entry)
+    finally:
+        try:
+            os.unlink(schema_path)
+        except OSError:
+            pass
+    entry["wall_seconds"] = round(time.time() - t0, 1)
+
+    try:
+        raw = json.loads(proc.stdout)
+    except ValueError:
+        fail("agy returned non-JSON (exit %d): %s" % (proc.returncode, (proc.stderr or proc.stdout)[:500]), entry)
+
+    entry["agy_usage"] = raw.get("usage")
+    if raw.get("status") != "SUCCESS":
+        fail("agy status %s: %s" % (raw.get("status"), str(raw.get("response"))[:500]), entry)
+
+    result = raw.get("structured_output")
+    if not isinstance(result, dict):
+        fail("agy gave no structured output; raw response: %s" % str(raw.get("response"))[:800], entry)
+
+    out = {"status": "ok", "model": args.model, "mode": mode,
+           "duration_s": round(raw.get("duration_seconds", entry["wall_seconds"]), 1)}
+    out.update({k: v for k, v in result.items() if v not in ("", [], None)})
+    out_txt = json.dumps(out, indent=2)
+
+    entry.update(
+        status="ok",
+        confidence=result.get("confidence"),
+        result_tokens_est=len(out_txt) // BYTES_PER_TOKEN,
+    )
+    log_ledger(entry)
+    print(out_txt)
+
+
+def run_stats(args):
+    if not os.path.exists(LEDGER):
+        print("No ledger yet at %s" % LEDGER)
+        return
+    cutoff = time.time() - args.days * 86400
+    rows = []
+    with open(LEDGER) as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+                ts = time.mktime(time.strptime(r["ts"][:19], "%Y-%m-%dT%H:%M:%S"))
+            except (ValueError, KeyError):
+                continue
+            if ts >= cutoff:
+                rows.append(r)
+    ok = [r for r in rows if r.get("status") == "ok"]
+    print("Last %d days: %d calls (%d ok, %d failed)" % (args.days, len(rows), len(ok), len(rows) - len(ok)))
+    if not ok:
+        return
+    scope = sum(r.get("scope_tokens_est", 0) for r in ok)
+    res = sum(r.get("result_tokens_est", 0) for r in ok)
+    agy_tot = sum((r.get("agy_usage") or {}).get("total_tokens", 0) for r in ok)
+    print("Scope handed to agy (est. tokens, upper bound of what Claude would have read): %d" % scope)
+    print("Result tokens returned to Claude (est.):                                      %d" % res)
+    print("Max context kept out of Claude (scope - result, upper bound):                 %d" % max(scope - res, 0))
+    print("Antigravity-side tokens spent (from agy usage):                               %d" % agy_tot)
+    print("Median wall time: %.0fs" % sorted(r.get("wall_seconds", 0) for r in ok)[len(ok) // 2])
+    low = [r for r in ok if r.get("confidence") == "low"]
+    print("Low-confidence results: %d" % len(low))
+    small = [r for r in ok if r.get("scope_tokens_est", 0) < 5000]
+    if small:
+        print("Warning: %d calls had scope < ~5k tokens; probably not worth delegating." % len(small))
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "stats":
+        ap = argparse.ArgumentParser(prog="anticlaudity stats")
+        ap.add_argument("--days", type=int, default=7)
+        ap.add_argument("stats")
+        run_stats(ap.parse_args())
+        return
+    ap = argparse.ArgumentParser(
+        prog="anticlaudity",
+        description="Delegate bulk reading/mechanical work to Antigravity (agy).")
+    ap.add_argument("task", help="what to do ('-' reads the task from stdin)")
+    ap.add_argument("--path", action="append", default=[], help="file/dir to read (repeatable)")
+    ap.add_argument("--cwd", help="working directory for agy (default: current dir)")
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    ap.add_argument("--timeout", type=int, default=300, help="seconds (default 300)")
+    ap.add_argument("--max-findings", type=int, default=15)
+    ap.add_argument("--write", action="store_true", help="allow edits (agy --mode accept-edits)")
+    run_delegate(ap.parse_args())
+
+
+if __name__ == "__main__":
+    main()
