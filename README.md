@@ -40,7 +40,7 @@ You ──▶ Claude Code ──▶ anticlaudity ──▶ agy -p (Gemini Flash,
 
 1. The bundled **skill** (`delegate-to-antigravity`) teaches Claude when delegating is worthwhile: big inputs, short answers, mechanical work.
 2. Claude runs `anticlaudity "<task>" --path <files/dirs>`.
-3. The wrapper calls `agy -p` in read-only mode with a strict output schema and returns compact JSON.
+3. The wrapper splits big scopes into chunks (default ~40k tokens each), runs them through `agy -p` in parallel and read-only with a strict output schema, and merges them into one compact JSON.
 4. Claude spot-checks one or two cited `file:line` references, then carries on. The raw source never enters Claude's context.
 
 ## Usage
@@ -49,17 +49,28 @@ You ──▶ Claude Code ──▶ anticlaudity ──▶ agy -p (Gemini Flash,
 anticlaudity "Summarize the auth flow; list file:line for each step" --path docs/spec.md --path src/auth
 anticlaudity "Which tests failed and why?" --path ci.log
 anticlaudity "Add a one-line docstring to every function" --path utils.py --write
+anticlaudity "Map the architecture" --path src --dry-run   # show the chunk plan, send nothing
 anticlaudity stats --days 7
 ```
+
+### Big projects
+
+Scopes are expanded to a file list (skipping `node_modules`, `.git`, lockfiles and binaries) and cut into chunks, so no single `agy` call has to swallow the whole project. If a chunk times out or comes back empty, it is retried and then split in half; whatever was covered is still returned, and anything that wasn't is listed in `uncovered_files` with `status: "partial"`. Scopes needing more than `--max-chunks` chunks are refused up front, with a hint to narrow `--path`.
+
+For large scopes (more than ~100k tokens), run it in the background, since Claude Code's shell tool gives up on a command after 10 minutes. Use `--dry-run` first to see the plan.
 
 | Option | Meaning |
 |---|---|
 | `--path P` | File or directory to read (repeatable). Always pass it so scope is bounded. |
 | `--model M` | Antigravity model (default `gemini-3.8-flash-medium`; list with `agy models`). |
-| `--effort E` | `low`, `medium`, `high`, `xhigh`, `max`. |
+| `--effort E` | `low`, `medium`, `high`, `xhigh`, `max`. On `gemini-…-low/medium/high` models this swaps the model's suffix (agy rejects the two together); `xhigh`/`max` are ignored there. |
 | `--write` | Allow edits (`agy --mode accept-edits`). Off by default; review `git diff` afterwards. |
-| `--timeout S` | Seconds before giving up (default 300). |
-| `--max-findings N` | Cap on returned findings (default 15). |
+| `--timeout S` | Seconds per `agy` call before it is killed (default 420). |
+| `--max-findings N` | Approximate total findings, shared across chunks (default 15). |
+| `--chunk-tokens N` | Target source size per `agy` call (default 40000). |
+| `--jobs N` | Parallel `agy` calls (default 3; always 1 with `--write`). |
+| `--max-chunks N` | Refuse scopes needing more chunks than this (default 20). |
+| `--dry-run` | Print the chunk plan and exit without calling `agy`. |
 | `--cwd DIR` | Working directory for `agy`. |
 
 Output:
@@ -72,13 +83,14 @@ Output:
   "duration_s": 10.3,
   "confidence": "high",
   "summary": "…",
-  "findings": [{ "path": "/abs/path.py", "line": 70, "note": "…" }]
+  "findings": [{ "path": "/abs/path.py", "line": 70, "note": "…" }],
+  "est_claude_tokens_saved": 41200
 }
 ```
 
-Failures return `{"status":"error","error":"…"}` with exit code 1.
+`status` is `ok`, `partial` (some files not covered; see `uncovered_files`) or `error` (exit code 1, `{"status":"error","error":"…"}`).
 
-Environment: `ANTICLAUDITY_MODEL`, `ANTICLAUDITY_LEDGER` (default `~/.anticlaudity/ledger.jsonl`), `ANTICLAUDITY_AGY`.
+Environment: `ANTICLAUDITY_MODEL`, `ANTICLAUDITY_LEDGER` (default `~/.anticlaudity/ledger.jsonl`), `ANTICLAUDITY_AGY`, `ANTICLAUDITY_CHUNK_TOKENS`, `ANTICLAUDITY_JOBS`, `ANTICLAUDITY_READ_FRACTION`.
 
 ## What to delegate
 
@@ -92,12 +104,18 @@ Environment: `ANTICLAUDITY_MODEL`, `ANTICLAUDITY_LEDGER` (default `~/.anticlaudi
 
 ## Measuring the savings
 
-Every call is logged to the ledger. `anticlaudity stats` reports:
+Every call is logged to the ledger. `anticlaudity stats [--days N] [--json]` reports:
 
-- **Scope** handed to `agy` (estimated tokens, bytes/4).
-- **Result** tokens returned to Claude.
-- **Max context kept out of Claude** (scope − result). This is an **upper bound**, not a measurement: it assumes Claude would otherwise have read everything.
-- Antigravity-side tokens spent, median wall time, low-confidence results, and calls that were too small to be worth delegating.
+- **Claude tokens kept out of your context**, as two numbers:
+  - *likely*: assumes Claude would have read about half of the scope (it usually greps and narrows first). Tune with `ANTICLAUDITY_READ_FRACTION`.
+  - *upper bound*: assumes Claude would have read all of it.
+  - Both subtract the size of the result Claude receives. Files that were not covered (partial or failed calls) count as zero.
+- Source handed to Antigravity, result size, and the compression ratio.
+- Antigravity-side tokens spent, including how much went on failed calls.
+- Success rate, failures grouped by cause, retries and splits, median wall time, and calls too small to be worth delegating.
+- Saved tokens per day.
+
+These are **estimates** (about 4 bytes per token on the files handed over), not a measurement of your Claude bill.
 
 ## Honest limitations
 

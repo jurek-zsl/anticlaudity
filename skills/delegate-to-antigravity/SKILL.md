@@ -25,15 +25,17 @@ anticlaudity "<precise task>" --path <file-or-dir> [--path ...]
 ```
 - Always pass `--path` so scope is bounded (and the ledger can measure savings).
 - Make the task specific and say what output you want (e.g. "list with file:line", "max 10 bullets").
-- Optional: `--model gemini-3.8-flash-high` for harder reading, `--effort high`, `--timeout 600`.
+- Optional: `--model gemini-3.8-flash-high` for harder reading (or `--effort high`), `--timeout 600`.
+- Big scopes are chunked and run in parallel automatically. For a whole project or anything over ~100k tokens: first run with `--dry-run` to see the plan, then run the real call with `run_in_background: true` (the shell tool dies after 10 minutes) and wait for the notification. Progress goes to stderr.
+- If the call is refused as "scope too large", narrow `--path` (e.g. one subsystem per call) rather than raising `--max-chunks`.
 - Edits are opt-in: `--write` lets agy modify files. Use only for clearly mechanical changes, then review `git diff`.
-- Output JSON: `status`, `summary`, `findings[{path,line,note}]`, `confidence`, optional `caveats`. On failure `status` is `error`.
+- Output JSON: `status` (`ok` | `partial` | `error`), `summary`, `findings[{path,line,note}]`, `confidence`, optional `caveats`, `uncovered_files`, `est_claude_tokens_saved`.
 
 ## After the call (required)
-1. If `status` is `error` or `confidence` is `low`, or `caveats` mention incomplete coverage: do the work yourself or retry narrower. Do not present it as reliable.
+1. If `status` is `error` or `confidence` is `low`, or `caveats` mention incomplete coverage: do the work yourself or retry narrower. Do not present it as reliable. On `partial`, read the `uncovered_files` yourself (or re-delegate just those) before drawing conclusions about the whole project.
 2. Spot-check 1-2 of the cited `file:line` findings against the real files (read just those lines, not the whole source). If any is wrong, distrust the rest.
 3. Tell the user briefly that the result came from a delegated Antigravity run, and note any caveats.
 4. Never base security-, money-, or data-loss-relevant decisions on an unverified delegated result.
 
 ## Measuring
-`anticlaudity stats` summarizes the ledger (`~/.anticlaudity/ledger.jsonl`): scope handed off, result size returned, Antigravity tokens spent, low-confidence and too-small calls. Run it when the user asks whether delegation is paying off.
+`anticlaudity stats` summarizes the ledger (`~/.anticlaudity/ledger.jsonl`): estimated Claude tokens saved (a likely figure and an upper bound), source handed off vs. result returned, Antigravity tokens spent, failures by cause, low-confidence and too-small calls. Run it when the user asks how many tokens it saved or whether delegation is paying off, and quote the *likely* figure, noting it is an estimate.
